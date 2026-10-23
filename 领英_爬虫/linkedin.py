@@ -106,6 +106,7 @@ def person_info(url):
         name = name.replace(' ', '')
         return name
 
+    global sheet
     sheet.append([get_person_name(), get_school_name()])
 
 

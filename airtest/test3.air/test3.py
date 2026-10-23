@@ -54,12 +54,12 @@ print("*************************************")
 #         print(tags)
 #         keyevent("BACK")
             
-#     swipe((x*0.5,y*0.9),(x*0.5,y*0.1),duration = 0.5)
-#     swipe((x*0.5,y*0.9),(x*0.5,y*0.1),duration = 0.5)
-#     swipe((574,1922),(747,632),duration = 3)
-#     sleep(2)
-#     if num == 4:
-#         break
+    swipe((x*0.5,y*0.9),(x*0.5,y*0.1),duration = 0.5)
+    swipe((x*0.5,y*0.9),(x*0.5,y*0.1),duration = 0.5)
+    swipe((574,1922),(747,632),duration = 3)
+    sleep(2)
+    if num == 4:
+        break
      
 
 
