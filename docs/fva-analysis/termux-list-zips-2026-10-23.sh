@@ -8,7 +8,7 @@ set -u
 
 # ===== 1. نصب ابزارهای لازم (یک بار) =====
 echo "=== نصب ابزارها ==="
-pkg update -y && pkg install -y unzip p7zip unrar termux-tools
+pkg update -y && pkg install -y unzip unrar libarchive termux-tools
 
 # اگر bsdtar بخواید (برای RAR هم کار می‌کنه):
 # pkg install -y libarchive

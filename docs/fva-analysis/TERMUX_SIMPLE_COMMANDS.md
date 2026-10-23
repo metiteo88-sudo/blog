@@ -7,7 +7,7 @@
 
 ### نصب (یک بار):
 ```bash
-pkg update -y && pkg install -y unzip p7zip unrar
+pkg update -y && pkg install -y unzip unrar libarchive
 ```
 
 ### تنظیم مسیر درایو (خودتون عوض کنید):
