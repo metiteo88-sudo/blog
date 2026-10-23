@@ -37,3 +37,16 @@ git checkout -b my-old-branch c0da22f
 
 تاریخ ایجاد: 2026-10-23
 سازنده: metiteo88-sudo via Arena
+
+## 📸 Snapshots صادقانه (جدید)
+
+پوشه `snapshots/` شامل شواهد واقعی از هر شاخه است:
+
+- `COMPARISON_HONEST_REPORT.md` - گزارش کامل مقایسه با تمام diff ها
+- `arena-a5be7c89-blog/tools/fva-drive-analyzer/fva_analyze.py` - نسخه قدیمی 1579 خطی (استخراج واقعی از گیت)
+- `master-reference/fva_analyze.py` - نسخه فعلی 1754 خطی
+- `revert-3-arena-f9dcde02-blog/` - نشان حذف آنالایزر
+- `EVIDENCE.md` - روش استخراج و نحوه اعتبارسنجی
+- `*.patch` - patch های واقعی برای اعمال مجدد
+
+همه فایل‌ها با `git show` استخراج شده‌اند - هیچ چیز ساختگی نیست.

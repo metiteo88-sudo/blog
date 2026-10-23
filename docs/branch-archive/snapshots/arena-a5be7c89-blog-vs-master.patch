@@ -1,0 +1,479 @@
+diff --git a/tools/fva-drive-analyzer/fva_analyze.py b/tools/fva-drive-analyzer/fva_analyze.py
+index 0079c2d..321763c 100644
+--- a/tools/fva-drive-analyzer/fva_analyze.py
++++ b/tools/fva-drive-analyzer/fva_analyze.py
+@@ -29,6 +29,7 @@ import mimetypes
+ import os
+ import re
+ import shutil
++import stat
+ import subprocess
+ import sys
+ import tarfile
+@@ -328,12 +329,16 @@ def _xml_text(blob: bytes) -> str:
+ def looks_like_text(sample: bytes) -> bool:
+     if not sample:
+         return True
+-    if b"\x00" in sample:
++    if sample.startswith(codecs.BOM_UTF16_LE) or sample.startswith(
++        codecs.BOM_UTF16_BE
++    ):
+         try:
+             sample.decode("utf-16")
+             return True
+         except Exception:
+             return False
++    if b"\x00" in sample:
++        return False
+     for encoding in ("utf-8-sig", "cp1256", "latin-1"):
+         try:
+             sample.decode(encoding)
+@@ -348,9 +353,12 @@ def extract_text_from_stream(
+ ) -> tuple[str, bool]:
+     """Decode a byte stream incrementally.  Returns (text, reached_eof).
+ 
+-    Decoding tries UTF-8 (with BOM) then UTF-16 then Windows-1256 (common
+-    for older Persian text), always tolerating bad bytes so one corrupt
+-    byte cannot make a whole book "unreadable".
++    UTF-16 is used only when an explicit UTF-16 BOM is present; arbitrary
++    even-length bytes are never guessed as UTF-16.  Otherwise an incremental
++    UTF-8 decoder is used and, when that produces many replacement
++    characters, the bytes are retried as Windows-1256 (common for older
++    Persian text).  When reading stops before EOF, an incomplete trailing
++    character is left undecoded instead of becoming a replacement char.
+     """
+     buffered = bytearray()
+     reached_eof = False
+@@ -362,14 +370,19 @@ def extract_text_from_stream(
+     else:
+         reached_eof = True
+     data = bytes(buffered)
+-    for encoding in ("utf-8-sig", "utf-16", "cp1256"):
+-        try:
+-            text = data.decode(encoding)
+-            break
+-        except Exception:
+-            continue
++    if data.startswith(codecs.BOM_UTF16_LE) or data.startswith(
++        codecs.BOM_UTF16_BE
++    ):
++        decoder = codecs.getincrementaldecoder("utf-16")(errors="replace")
++        text = decoder.decode(data, final=reached_eof)
+     else:
+-        text = data.decode("utf-8", errors="replace")
++        decoder = codecs.getincrementaldecoder("utf-8-sig")(errors="replace")
++        text = decoder.decode(data, final=reached_eof)
++        replacement_count = text.count("\ufffd")
++        if replacement_count > 8 and replacement_count / max(len(text), 1) > 0.01:
++            fallback = data.decode("cp1256", errors="replace")
++            if fallback.count("\ufffd") < replacement_count:
++                text = fallback
+     if len(text) > max_chars:
+         text = text[:max_chars]
+         reached_eof = False
+@@ -420,11 +433,24 @@ def extract_office_text(path: Path, max_chars: int) -> tuple[str, str]:
+             else:
+                 wanted = []
+             truncated = False
+-            for name in sorted(wanted):
++            member_limit = max(1_000_000, max_chars * 4)
++            wanted_names = set(wanted)
++            wanted_infos = [
++                info for info in zf.infolist() if info.filename in wanted_names
++            ]
++            for info in sorted(wanted_infos, key=lambda item: item.filename):
++                name = info.filename
++                if info.file_size > member_limit:
++                    truncated = True
++                    continue
+                 try:
+-                    blob = zf.read(name)
++                    with zf.open(info) as member:
++                        blob = member.read(member_limit + 1)
+                 except Exception:
+                     continue
++                if len(blob) > member_limit:
++                    truncated = True
++                    continue
+                 if suffix == ".epub" and not name.lower().endswith((".opf", ".ncx", ".xml")):
+                     piece = _strip_html(
+                         blob.decode("utf-8", errors="replace")
+@@ -660,11 +686,22 @@ def list_archive(path: Path) -> tuple[list[ArchiveMember], str]:
+ # Hashing (streaming, cached)
+ # --------------------------------------------------------------------------- #
+ 
++def _open_output_text(path: Path, *, encoding: str, newline: Optional[str] = None):
++    """Open a report file without following a pre-existing symlink there."""
++    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
++    if hasattr(os, "O_NOFOLLOW"):
++        flags |= os.O_NOFOLLOW
++    if hasattr(os, "O_CLOEXEC"):
++        flags |= os.O_CLOEXEC
++    fd = os.open(path, flags, 0o600)
++    return os.fdopen(fd, "w", encoding=encoding, newline=newline)
++
++
+ class HashCache:
+     def __init__(self, path: Path) -> None:
+         self.path = path
+         self.entries: dict[str, dict[str, Any]] = {}
+-        if path.is_file():
++        if path.is_file() and not path.is_symlink():
+             try:
+                 with open(path, "r", encoding="utf-8") as fh:
+                     raw = json.load(fh)
+@@ -685,7 +722,7 @@ class HashCache:
+ 
+     def save(self) -> None:
+         self.path.parent.mkdir(parents=True, exist_ok=True)
+-        with open(self.path, "w", encoding="utf-8") as fh:
++        with _open_output_text(self.path, encoding="utf-8") as fh:
+             json.dump(self.entries, fh, ensure_ascii=False, sort_keys=True)
+ 
+ 
+@@ -775,6 +812,53 @@ class ScanOptions:
+     hash_max_bytes: int = 0  # 0 = unlimited
+ 
+ 
++def _special_entry_row(
++    path: Path,
++    rel_path: str,
++    kw: KeywordSet,
++    reason: str,
++    type_label: str,
++    stat_result: Optional[os.stat_result] = None,
++) -> Row:
++    """Build an unread row for a symlink/special entry without opening it."""
++    sensitive = is_sensitive(path.name, rel_path, kw)
++    joined = normalise(path.name + " " + rel_path)
++    ev = Evidence(
++        name_strong=find_terms(joined, kw.strong),
++        name_weak=find_terms(joined, kw.weak),
++    )
++    section, confidence, classification_reason = classify(
++        item_type="file", sensitive=sensitive, read_status="unread",
++        unread_reason=reason, ev=ev,
++    )
++    size_int = int(stat_result.st_size) if stat_result is not None else 0
++    return Row(
++        name=path.name, item_id=local_id(rel_path), path=rel_path,
++        type_label=type_label, item_type="file",
++        size=str(size_int) if stat_result is not None else "",
++        size_int=size_int,
++        modified=iso_time(stat_result.st_mtime) if stat_result is not None else "",
++        shared="نامشخص", readable=f"خیر — {reason}", section=section,
++        confidence=confidence, reason=classification_reason,
++        sensitive=sensitive, digest="", digest_kind="",
++        matched_terms=sorted(set(ev.name_strong) | set(ev.name_weak)),
++        top_folder=_top_folder(rel_path), extension=path.suffix.lower(),
++        read_status="unread", unread_reason=reason,
++    )
++
++
++def _special_type_label(mode: int) -> str:
++    if stat.S_ISLNK(mode):
++        return "symlink"
++    if stat.S_ISFIFO(mode):
++        return "fifo"
++    if stat.S_ISSOCK(mode):
++        return "socket"
++    if stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
++        return "device"
++    return "special"
++
++
+ def analyze_local_file(
+     path: Path,
+     rel_path: str,
+@@ -785,14 +869,37 @@ def analyze_local_file(
+ ) -> Row:
+     name = path.name
+     suffix = path.suffix.lower()
++    try:
++        lstat_result = path.lstat()
++    except OSError as exc:
++        return _special_entry_row(
++            path, rel_path, kw,
++            f"lstat ناموفق بود: {type(exc).__name__}",
++            "unknown (lstat failed)",
++        )
++    if stat.S_ISLNK(lstat_result.st_mode):
++        return _special_entry_row(
++            path, rel_path, kw,
++            "پیوند نمادین است و برای ایمنی دنبال نشد",
++            "symlink", lstat_result,
++        )
++    if not (
++        stat.S_ISREG(lstat_result.st_mode)
++        or stat.S_ISDIR(lstat_result.st_mode)
++    ):
++        return _special_entry_row(
++            path, rel_path, kw,
++            "فایل ویژه است و خوانده نشد",
++            _special_type_label(lstat_result.st_mode), lstat_result,
++        )
+     mime = mimetypes.guess_type(name)[0] or (
+         "folder" if path.is_dir() else f"file{suffix}"
+     )
+     try:
+-        stat = path.stat()
+-        size_int = int(stat.st_size) if path.is_file() else 0
+-        modified = iso_time(stat.st_mtime)
+-        mtime_ns = int(stat.st_mtime_ns)
++        file_stat = path.stat()
++        size_int = int(file_stat.st_size) if path.is_file() else 0
++        modified = iso_time(file_stat.st_mtime)
++        mtime_ns = int(file_stat.st_mtime_ns)
+     except OSError as exc:
+         size_int, modified, mtime_ns = 0, "", 0
+         ev = Evidence(
+@@ -964,19 +1071,63 @@ def scan_local_tree(
+     *, include_folders: bool, offset: int, limit: int,
+     batch_size: int, progress: bool,
+ ) -> tuple[list[Row], list[ArchiveMember], dict[str, Any]]:
+-    entries: list[Path] = []
++    entries: list[tuple[Path, Optional[Row]]] = []
++
++    def special_for(candidate: Path) -> tuple[Path, Optional[Row]]:
++        rel = candidate.relative_to(root).as_posix()
++        try:
++            lstat_result = candidate.lstat()
++        except OSError as exc:
++            return candidate, _special_entry_row(
++                candidate, rel, kw,
++                f"lstat ناموفق بود: {type(exc).__name__}",
++                "unknown (lstat failed)",
++            )
++        if stat.S_ISLNK(lstat_result.st_mode):
++            return candidate, _special_entry_row(
++                candidate, rel, kw,
++                "پیوند نمادین است و برای ایمنی دنبال نشد",
++                "symlink", lstat_result,
++            )
++        return candidate, _special_entry_row(
++            candidate, rel, kw,
++            "فایل ویژه است و خوانده نشد",
++            _special_type_label(lstat_result.st_mode), lstat_result,
++        )
++
+     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+         dirnames.sort()
+         filenames.sort()
+         current = Path(dirpath)
+-        if include_folders:
+-            for dirname in list(dirnames):
+-                entries.append(current / dirname)
++        real_dirnames: list[str] = []
++        for dirname in list(dirnames):
++            candidate = current / dirname
++            try:
++                mode = candidate.lstat().st_mode
++            except OSError:
++                entries.append(special_for(candidate))
++                continue
++            if not stat.S_ISDIR(mode):
++                entries.append(special_for(candidate))
++                continue
++            real_dirnames.append(dirname)
++            if include_folders:
++                entries.append((candidate, None))
++        dirnames[:] = real_dirnames
+         for filename in filenames:
+-            entries.append(current / filename)
++            candidate = current / filename
++            try:
++                mode = candidate.lstat().st_mode
++            except OSError:
++                entries.append(special_for(candidate))
++                continue
++            if stat.S_ISREG(mode):
++                entries.append((candidate, None))
++            else:
++                entries.append(special_for(candidate))
+ 
+-    def sort_key(p: Path) -> str:
+-        return p.relative_to(root).as_posix()
++    def sort_key(item: tuple[Path, Optional[Row]]) -> str:
++        return item[0].relative_to(root).as_posix()
+ 
+     entries.sort(key=sort_key)
+     total_seen = len(entries)
+@@ -986,9 +1137,14 @@ def scan_local_tree(
+ 
+     rows: list[Row] = []
+     archive_rows: list[ArchiveMember] = []
+-    for index, entry in enumerate(selected, start=1):
++    for index, (entry, special_row) in enumerate(selected, start=1):
+         rel = entry.relative_to(root).as_posix()
+-        rows.append(analyze_local_file(entry, rel, kw, opts, cache, archive_rows))
++        if special_row is not None:
++            rows.append(special_row)
++        else:
++            rows.append(
++                analyze_local_file(entry, rel, kw, opts, cache, archive_rows)
++            )
+         if progress and batch_size > 0 and index % batch_size == 0:
+             print(f"[progress] processed {offset + index}/{total_seen}", file=sys.stderr)
+     meta = {
+@@ -1239,7 +1395,7 @@ def empty_folders(rows: list[Row]) -> list[Row]:
+ 
+ 
+ def write_csv(path: Path, headers: list[str], records: Iterable[list[str]]) -> None:
+-    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
++    with _open_output_text(path, encoding="utf-8-sig", newline="") as fh:
+         writer = csv.writer(fh)
+         writer.writerow(headers)
+         for record in records:
+@@ -1351,11 +1507,15 @@ def build_summary(
+             examples = "، ".join(term_examples[term])
+             lines.append(f"- `{term}`: {count} فایل — مثال نام فایل: {examples}")
+ 
+-    folders_empty = empty_folders(live)
+     lines.append("")
+-    lines.append(f"## پوشه‌های خالی ({len(folders_empty)})")
+-    for row in folders_empty:
+-        lines.append(f"- {row.path}")
++    if meta.get("partial"):
++        lines.append("## پوشه‌های خالی (در اجرای ناقص محاسبه نشد)")
++        lines.append("- برای نتیجه سراسری معتبر، اجرا باید روی کل بازه انجام شود.")
++    else:
++        folders_empty = empty_folders(live)
++        lines.append(f"## پوشه‌های خالی ({len(folders_empty)})")
++        for row in folders_empty:
++            lines.append(f"- {row.path}")
+ 
+     big = sorted((r for r in files if r.size_int > 100 * 1000 * 1000),
+                  key=lambda r: -r.size_int)
+@@ -1372,14 +1532,18 @@ def build_summary(
+         lines.append(f"- حساس: {row.path}")
+ 
+     lines.append("")
+-    lines.append(f"## کاندیدهای تکراری ({len(duplicate_groups)} گروه)")
+-    lines.append("فقط گروه‌هایی با هش و حجم یکسان گزارش شده‌اند؛ هیچ حذفی پیشنهاد یا انجام نمی‌شود.")
+-    for group in duplicate_groups:
+-        first = group[0]
+-        lines.append(
+-            f"- {first.duplicate_group}: {len(group)} فایل؛ حجم {first.size}؛ "
+-            + "؛ ".join(r.path for r in group)
+-        )
++    if meta.get("partial"):
++        lines.append("## کاندیدهای تکراری (در اجرای ناقص محاسبه نشد)")
++        lines.append("- گروه‌بندی تکراری سراسری فقط پس از اجرای روی کل بازه معتبر است.")
++    else:
++        lines.append(f"## کاندیدهای تکراری ({len(duplicate_groups)} گروه)")
++        lines.append("فقط گروه‌هایی با هش و حجم یکسان گزارش شده‌اند؛ هیچ حذفی پیشنهاد یا انجام نمی‌شود.")
++        for group in duplicate_groups:
++            first = group[0]
++            lines.append(
++                f"- {first.duplicate_group}: {len(group)} فایل؛ حجم {first.size}؛ "
++                + "؛ ".join(r.path for r in group)
++            )
+ 
+     lines.append("")
+     lines.append(f"## آرشیوها")
+@@ -1387,6 +1551,7 @@ def build_summary(
+     lines.append("- آرشیو حساس فهرست‌برداری نشده است.")
+     lines.append("")
+     lines.append("## محدودیت‌های این اجرا")
++    lines.append("- هر اجرای دسته‌ای (`--offset`/`--limit`) باید پوشه `--out` جداگانه داشته باشد؛ نام خروجی‌ها ثابت است و اجرای بعدی در همان پوشه، گزارش‌های قبلی را بازنویسی می‌کند.")
+     lines.append("- این ابزار به Google Drive وصل نمی‌شود؛ روی کپی محلی یا فهرست JSON کار می‌کند.")
+     lines.append("- در حالت محلی، اشتراکی‌بودن و مالکیت درایو «نامشخص» است.")
+     lines.append("- در حالت JSON، بایت فایل‌ها در دسترس نیست؛ پس همه فایل‌ها از نظر محتوا «خوانده نشد» هستند.")
+@@ -1500,7 +1665,8 @@ def main(argv: Optional[list[str]] = None) -> int:
+         print("[error] منبع باید پوشه یا فایل .json باشد", file=sys.stderr)
+         return 2
+ 
+-    duplicate_groups = assign_duplicate_groups(rows)
++    is_partial = bool(meta.get("partial"))
++    duplicate_groups = [] if is_partial else assign_duplicate_groups(rows)
+ 
+     relevance_path = out_dir / "FVA_relevance_map_2026-10-23.csv"
+     write_csv(relevance_path, HEADERS, (row.to_csv() for row in rows))
+@@ -1513,15 +1679,16 @@ def main(argv: Optional[list[str]] = None) -> int:
+             for m in archive_rows
+         ),
+     )
+-    write_csv(
+-        out_dir / "duplicate_candidates.csv",
+-        ["گروه", "نوع هش", "هش", "حجم", "نام", "مسیر فعلی", "شناسه"],
+-        (
+-            [row.duplicate_group, row.digest_kind, row.digest, row.size,
+-             row.name, row.path, row.item_id]
+-            for group in duplicate_groups for row in group
+-        ),
+-    )
++    if not is_partial:
++        write_csv(
++            out_dir / "duplicate_candidates.csv",
++            ["گروه", "نوع هش", "هش", "حجم", "نام", "مسیر فعلی", "شناسه"],
++            (
++                [row.duplicate_group, row.digest_kind, row.digest, row.size,
++                 row.name, row.path, row.item_id]
++                for group in duplicate_groups for row in group
++            ),
++        )
+     unread = [
+         row for row in rows
+         if row.item_type == "file" and (row.read_status == "unread" or row.sensitive)
+@@ -1531,19 +1698,34 @@ def main(argv: Optional[list[str]] = None) -> int:
+         HEADERS,
+         (row.to_csv() for row in unread),
+     )
+-    write_csv(
+-        out_dir / "empty_folders.csv",
+-        HEADERS,
+-        (row.to_csv() for row in empty_folders([r for r in rows if not r.trashed])),
+-    )
++    if not is_partial:
++        write_csv(
++            out_dir / "empty_folders.csv",
++            HEADERS,
++            (
++                row.to_csv()
++                for row in empty_folders([r for r in rows if not r.trashed])
++            ),
++        )
+ 
+     summary = build_summary(
+         rows, archive_rows, duplicate_groups, meta,
+         args.expected_files, args.expected_folders,
+     )
+-    with open(out_dir / "summary.md", "w", encoding="utf-8") as fh:
++    with _open_output_text(out_dir / "summary.md", encoding="utf-8") as fh:
+         fh.write(summary)
+ 
++    outputs = [
++        "FVA_relevance_map_2026-10-23.csv",
++        "archive_contents.csv",
++        "unread_and_sensitive.csv",
++        "summary.md",
++        "state.json",
++    ]
++    if not is_partial:
++        outputs.extend(["duplicate_candidates.csv", "empty_folders.csv"])
++    outputs.sort()
++
+     state = dict(meta)
+     state.update({
+         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+@@ -1552,17 +1734,10 @@ def main(argv: Optional[list[str]] = None) -> int:
+         "folders_live": sum(1 for r in rows if r.item_type == "folder" and not r.trashed),
+         "trashed_items": sum(1 for r in rows if r.trashed),
+         "rows_written": len(rows),
+-        "outputs": [
+-            "FVA_relevance_map_2026-10-23.csv",
+-            "archive_contents.csv",
+-            "duplicate_candidates.csv",
+-            "unread_and_sensitive.csv",
+-            "empty_folders.csv",
+-            "summary.md",
+-            "state.json",
+-        ],
++        "global_reports_skipped": is_partial,
++        "outputs": outputs,
+     })
+-    with open(out_dir / "state.json", "w", encoding="utf-8") as fh:
++    with _open_output_text(out_dir / "state.json", encoding="utf-8") as fh:
+         json.dump(state, fh, ensure_ascii=False, indent=2, sort_keys=True)
+ 
+     if cache is not None:

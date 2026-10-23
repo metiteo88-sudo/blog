@@ -1,0 +1,14 @@
+commit c0da22fddd233c24ddb04a385fa7f459adc9889a
+Author: Metiteoras001 <336750048+metiteo88-sudo@users.noreply.github.com>
+Date:   Fri Oct 23 12:49:46 2026 +0330
+
+    Revert "Add hardened read-only FVA Drive analyzer"
+
+ .gitignore                                         |    4 -
+ airtest/test3.air/test3.py                         |   12 +-
+ tools/fva-drive-analyzer/README.md                 |   86 -
+ tools/fva-drive-analyzer/fva_analyze.py            | 1754 --------------------
+ tools/fva-drive-analyzer/keywords.json             |   73 -
+ tools/fva-drive-analyzer/test_fva_analyze.py       |  362 ----
+ .../linkedin.py"                                   |    1 +
+ 7 files changed, 7 insertions(+), 2285 deletions(-)
