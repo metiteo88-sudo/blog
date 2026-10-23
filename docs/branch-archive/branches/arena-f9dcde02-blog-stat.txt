@@ -1,0 +1,16 @@
+commit 41370c876080f98d3aeb22b1c1bd00eb9d6f303c
+Author: metiteo88-sudo <336750048+metiteo88-sudo@users.noreply.github.com>
+Date:   Fri Oct 23 09:06:10 2026 +0000
+
+    Add hardened read-only FVA Drive analyzer
+    
+    Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+
+ .gitignore                                         |    4 +
+ airtest/test3.air/test3.py                         |   12 +-
+ tools/fva-drive-analyzer/README.md                 |   86 +
+ tools/fva-drive-analyzer/fva_analyze.py            | 1754 ++++++++++++++++++++
+ tools/fva-drive-analyzer/keywords.json             |   73 +
+ tools/fva-drive-analyzer/test_fva_analyze.py       |  362 ++++
+ .../linkedin.py"                                   |    1 -
+ 7 files changed, 2285 insertions(+), 7 deletions(-)
